@@ -10,55 +10,46 @@ import torch
 import torch2trt
 import tensorrt
 
+
 from packaging.version import Version
-from transformers import CLIPTextModel as CLIPTextModelHF, CLIPTextModelWithProjection, SiglipTextModel, AutoTokenizer
+from transformers import ChineseCLIPModel, AutoTokenizer
 from .utils import AttributeDict, convert_tensor, clip_model_type, trt_model_filename
+
 
 _clip_text_models = {}
 
 
-class CLIPTextModel():
+class ChineseCLIPTextModel():
     """
-    CLIP/SigLIP text encoder and tokenizer for generating text embeddings with TensorRT.
+    ChineseCLIP text encoder and tokenizer for generating text embeddings
     """
     ModelCache = {}
 
     @staticmethod
-    def from_pretrained(model="openai/clip-vit-large-patch14-336", dtype=torch.float16,
-                        projector=None, use_cache=True, use_tensorrt=True, **kwargs):
+    def from_pretrained(model="OFA-Sys/chinese-clip-vit-large-patch14-336px", dtype=torch.float16, use_cache=True, **kwargs):
         """
         Load a CLIP or SigLIP text encoder model from HuggingFace Hub or a local checkpoint.
         Will use TensorRT for inference if ``use_tensorrt=True``, otherwise falls back to Transformers.
         """
-        if use_cache and model in CLIPTextModel.ModelCache:
-            return CLIPTextModel.ModelCache[model]
+        if use_cache and model in ChineseCLIPTextModel.ModelCache:
+            return ChineseCLIPTextModel.ModelCache[model]
 
-        instance = CLIPTextModel(model, dtype=dtype, projector=projector, use_tensorrt=use_tensorrt, **kwargs)
+        instance = ChineseCLIPTextModel(model, dtype=dtype, **kwargs)
 
         if use_cache:
-            CLIPTextModel.ModelCache[model] = instance
+            ChineseCLIPTextModel.ModelCache[model] = instance
 
         return instance
 
-    def __init__(self, model, dtype=torch.float16, projector=None, use_tensorrt=True, **kwargs):
+    def __init__(self, model, dtype=torch.float16, projector=False, use_tensorrt=False, **kwargs):
         model_types = {
-            'clip': dict(model=CLIPTextModelWithProjection if projector or projector is None else CLIPTextModelHF),
-            'siglip': dict(model=SiglipTextModel),
+            'chinese_clip':  dict(model=ChineseCLIPModel),
         }
 
         model_type = clip_model_type(model, types=model_types.keys())
 
         if model_type is None:
-            raise ValueError(
-                f"tried loading unrecognized CLIP model from {model} - supported model types are CLIP and SigLIP")
-
-        if projector is None:
-            projector = (model_type == 'clip')
-
-        if model_type == 'siglip':
-            if projector:
-                projector = False
-                logging.warning("disabling projector for SigLIP model {model}")
+            raise ValueError(f"tried loading unrecognized ChineseCLIP model from {model} - supported model types are ChineseCLIP")
 
         self.config = AttributeDict(name=model, type=model_type, projector=projector)
         self.stats = AttributeDict()
@@ -66,9 +57,7 @@ class CLIPTextModel():
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         self.stream = None
 
-        use_tensorrt = False  # TEMP
-
-        self.dtype = torch.float32 if use_tensorrt else dtype  # TRT handles FP16 internally
+        self.dtype = dtype
         self.output_dtype = dtype  # still output the embeddings with the requested dtype
         self.embed_cache = {}
 
@@ -76,12 +65,13 @@ class CLIPTextModel():
 
         factory = model_types[model_type]
 
-        self.model = factory['model'].from_pretrained(model, torch_dtype=self.dtype)  # .to(self.device).eval()
+        self.model = factory['model'].from_pretrained(model, torch_dtype=self.dtype)
 
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(model, use_fast=True, trust_remote_code=True)
         except:
             self.tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False, trust_remote_code=True)
+
 
         class TextEncoder(torch.nn.Module):
             def __init__(self, model):
@@ -90,7 +80,7 @@ class CLIPTextModel():
                 self.config = model.config
 
             def forward(self, input_ids, attention_mask=None, position_ids=None):
-                return self.model(
+                return self.model.get_text_features(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
@@ -105,78 +95,11 @@ class CLIPTextModel():
         logging.debug(f"{model_type} text model {model}\n\n{self.model}")
         logging.debug(f"{self.config.type} text model warmup ({self.config.name})")
 
-        self.embed_text("A dog and a cat sitting on a couch")
-
-        if use_tensorrt:
-            try:
-                self.init_trt(**kwargs)
-            except Exception as error:
-                logging.error(
-                    f"Exception occurred trying to use TensorRT for {model_type} model ({self.config.name})\n\n{traceback.format_exc()}")
+        self.embed_text("猫")
 
         logging.info(f"loaded {model_type} text model {model}")
 
-    def init_trt(self, trt_cache="~/.cache/clip_trt", **kwargs):
-        if Version(tensorrt.__version__) < Version('8.6'):
-            logging.warning(f"disabling CLIP with TensorRT {tensorrt.__version__} (requires TensorRT 8.6 or newer)")
-            return
-
-        if psutil.virtual_memory().total < 20 * (1024 ** 3):
-            logging.warning(f"disabling CLIP with TensorRT due to limited memory (falling back to Transformers API)")
-            return
-
-        suffix = f"text{'_projector' if self.config.projector else ''}"
-        trt_path = os.path.join(os.path.expanduser(trt_cache), trt_model_filename(self.config.name, suffix=suffix))
-        # input_ids = torch.ones(*self.config.input_shape, dtype=torch.int64, device='cuda')
-        # attention_mask = input_ids.detach().clone()
-        input_ids, attention_mask = self.tokenize(
-            "A dog and a cat went on a walk around a very long path, it was frought with danger and had many big things in it including far-away items of interest like rocks, germanium, rainbows, and clientel.  A chicken crossed the road to get where he was going. A hippo is a friendly and curious creature.",
-            device=self.device)
-
-        if os.path.isfile(trt_path):
-            logging.info(f"loading TensorRT model from {trt_path}")
-            trt_model = torch2trt.TRTModule()
-            trt_model.load_state_dict(torch.load(trt_path))
-        else:
-            logging.info(f"optimizing {self.config.name} with TensorRT...")
-
-            trt_model = torch2trt.torch2trt(
-                self.model,
-                [input_ids, attention_mask],
-                fp16_mode=True,
-                log_level=tensorrt.Logger.VERBOSE,
-                max_workspace_size=(1024 ** 3) * 3,
-                use_onnx=True,
-            )
-
-            logging.info(f"saving TensorRT model for {self.config.name} to {trt_path}")
-
-            os.makedirs(trt_cache, exist_ok=True)
-            torch.save(trt_model.state_dict(), trt_path)
-
-        def profile_model(model, runs=3):
-            for i in range(runs + 1):
-                if i == 1:
-                    time_begin = time.perf_counter()
-                output = model(input_ids, attention_mask)
-            torch.cuda.synchronize()
-            return (time.perf_counter() - time_begin) * 1000 / runs
-
-        key = 'text_embeds' if self.config.projector else 'pooler_output'
-
-        logging.info(f"benchmarking {self.config.type} text model {self.config.name}")
-        logging.info(f"torch time:  {profile_model(self.model)} ms")
-        logging.info(f"trt time:    {profile_model(trt_model)} ms")
-        logging.info(
-            f"y^ delta:    {torch.max(torch.abs(self.model(input_ids, attention_mask)[key] - trt_model(input_ids, attention_mask)[key]))}")
-
-        trt_model.config = self.model.config
-
-        self.model = trt_model
-        self.embed_text("A dog and a cat sitting on a couch")
-
-    def tokenize(self, text, padding='max_length', truncation=True, dtype=torch.int64, return_tensors='pt',
-                 return_dict=False, device=None, **kwargs):
+    def tokenize(self, text, padding='max_length', truncation=True, dtype=torch.int64, return_tensors='pt', return_dict=False, device=None, **kwargs):
         """
         Tokenize the given string and return the encoded token ID's and attention mask (either in a dict or as a tuple).
 
@@ -200,8 +123,7 @@ class CLIPTextModel():
         )
 
         output.input_ids = convert_tensor(output.input_ids, return_tensors=return_tensors, dtype=dtype, device=device)
-        output.attention_mask = convert_tensor(output.attention_mask, return_tensors=return_tensors, dtype=dtype,
-                                               device=device)
+        output.attention_mask = convert_tensor(output.attention_mask, return_tensors=return_tensors, dtype=dtype, device=device)
 
         if return_dict:
             return output
@@ -225,7 +147,6 @@ class CLIPTextModel():
                 attention_mask = attention_mask.unsqueeze(0)
 
             output = self.model(tokens, attention_mask)
-            output = output['text_embeds' if self.config.projector else 'pooler_output']
             output = convert_tensor(output, return_tensors=return_tensors, device=self.device, dtype=self.output_dtype)
 
             self.config.input_shape = tokens.shape
@@ -265,4 +186,5 @@ class CLIPTextModel():
             return self.embed_text(text, **kwargs)
         else:
             return self.embed_tokens(text, **kwargs)
+
 
